@@ -179,7 +179,6 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
   int currentIndex = 0;
   String selectedCategory = 'Music Library';
 
-  // Only songs 1-2 have pictures; extra songs automatically show the orange music icon!
   final List<Map<String, String>> songs = [
     {
       'title': 'Shri Durga Mahatmyam (Devi Mahatmyam)',
