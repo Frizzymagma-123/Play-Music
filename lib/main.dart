@@ -1,5 +1,4 @@
 import 'dart:math';
-import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -179,6 +178,7 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
   int currentIndex = 0;
   String selectedCategory = 'Music Library';
 
+  // Songs 1-2 show cover pictures; extra songs automatically show the orange music icon!
   final List<Map<String, String>> songs = [
     {
       'title': 'Shri Durga Mahatmyam (Devi Mahatmyam)',
@@ -224,14 +224,13 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
     }
 
     try {
-      final result = await FilePicker.pickFiles(
+      final files = await FilePicker.pickFiles(
         type: FileType.audio,
-        allowMultiple: true,
       );
 
-      if (result != null && result.files.isNotEmpty) {
+      if (files.isNotEmpty) {
         setState(() {
-          for (var picked in result.files) {
+          for (var picked in files) {
             if (picked.path != null) {
               songs.add({
                 'title': picked.name.replaceAll('.mp3', ''),
@@ -425,6 +424,16 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
                               width: 125,
                               height: 125,
                               fit: BoxFit.cover,
+                              errorBuilder: (context, error, stackTrace) => Container(
+                                width: 105,
+                                height: 105,
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFFF7A00).withValues(alpha: 0.14),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: const Icon(Icons.music_note_rounded,
+                                    size: 52, color: Color(0xFFFF7A00)),
+                              ),
                             ),
                           )
                         else
@@ -532,6 +541,12 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
                                       width: 45,
                                       height: 45,
                                       fit: BoxFit.cover,
+                                      errorBuilder: (context, error, stackTrace) => CircleAvatar(
+                                        backgroundColor:
+                                            const Color(0xFFFF7A00).withValues(alpha: 0.14),
+                                        child: const Icon(Icons.music_note_rounded,
+                                            color: Color(0xFFFF7A00)),
+                                      ),
                                     ),
                                   )
                                 : CircleAvatar(
