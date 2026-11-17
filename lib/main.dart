@@ -207,7 +207,7 @@ class PlayMusicAudioHandler extends BaseAudioHandler {
         MediaControl.skipToNext,
       ],
       systemActions: const {MediaAction.seek},
-      androidCompactActionIndices: const,
+      androidCompactActionIndices: const [0, 1, 2],
       processingState: AudioProcessingState.ready,
       playing: playing,
     ));
