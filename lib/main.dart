@@ -1,10 +1,16 @@
+import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:audio_service/audio_service.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
+
+late PlayMusicAudioHandler audioHandler;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -15,6 +21,16 @@ void main() async {
       appId: "1:395736519154:android:e139d66fe6ade95ea61b6b",
       messagingSenderId: "395736519154",
       projectId: "play-music-54f16",
+    ),
+  );
+
+  audioHandler = await AudioService.init(
+    builder: () => PlayMusicAudioHandler(),
+    config: const AudioServiceConfig(
+      androidNotificationChannelId: 'com.frizzymagma.play_music.channel.audio',
+      androidNotificationChannelName: 'Play Music Playback',
+      androidNotificationOngoing: true,
+      androidStopForegroundOnPause: true,
     ),
   );
 
@@ -39,6 +55,212 @@ class AuthGate extends StatelessWidget {
         return const LoginScreen();
       },
     );
+  }
+}
+class PlayMusicAudioHandler extends BaseAudioHandler {
+  final AudioPlayer player = AudioPlayer();
+  bool isShuffle = false;
+  int currentIndex = 0;
+
+  final List<Map<String, String>> builtInSongs = [
+    {
+      'title': 'Shri Durga Mahatmyam (Devi Mahatmyam)',
+      'artist': 'Traditional Sanskrit Recitation',
+      'genre': 'Navratri & Devotional Prayer',
+      'file': 'devi_mahatmyam.mp3',
+      'image': 'assets/diya.jpg',
+      'source': 'asset',
+    },
+    {
+      'title': 'Bharat Mata Namo Daya (Swatantra Janani)',
+      'artist': 'Traditional Indian Vocal',
+      'genre': 'Patriotic & Devotional Hymn',
+      'file': 'folk_1.mp3',
+      'image': 'assets/folk_devotional.jpg',
+      'source': 'asset',
+    },
+    {
+      'title': 'Soye Hue Hain Chand Aur Taare',
+      'artist': 'Traditional Indian Folk',
+      'genre': 'Classic Indian Folk',
+      'file': 'folk_2.mp3',
+      'source': 'asset',
+    },
+  ];
+
+  List<Map<String, String>> songs = [];
+  List<String> hiddenPaths = [];
+  VoidCallback? onStateChanged;
+
+  PlayMusicAudioHandler() {
+    songs = List.from(builtInSongs);
+    player.onPlayerComplete.listen((_) => skipToNext());
+  }
+
+  Future<void> loadAndScanStorageSongs() async {
+    final prefs = await SharedPreferences.getInstance();
+    hiddenPaths = prefs.getStringList('hidden_local_songs') ?? [];
+
+    final savedJson = prefs.getStringList('saved_local_songs') ?? [];
+    final loadedLocal = savedJson
+        .map((item) => Map<String, String>.from(jsonDecode(item)))
+        .where((s) => File(s['file']!).existsSync() && !hiddenPaths.contains(s['file']))
+        .toList();
+
+    songs = [...builtInSongs, ...loadedLocal];
+    onStateChanged?.call();
+
+    await Permission.notification.request();
+    var status = await Permission.storage.request();
+    if (!status.isGranted) {
+      status = await Permission.audio.request();
+    }
+
+    if (status.isGranted && Platform.isAndroid) {
+      final foldersToScan = [
+        Directory('/storage/emulated/0/Music'),
+        Directory('/storage/emulated/0/Download'),
+        Directory('/storage/emulated/0/Audio'),
+        Directory('/storage/emulated/0/Recordings'),
+      ];
+
+      bool foundNew = false;
+      for (final dir in foldersToScan) {
+        if (await dir.exists()) {
+          try {
+            await for (final entity in dir.list(recursive: true, followLinks: false)) {
+              if (entity is File) {
+                final lower = entity.path.toLowerCase();
+                if (lower.endsWith('.mp3') ||
+                    lower.endsWith('.m4a') ||
+                    lower.endsWith('.wav') ||
+                    lower.endsWith('.ogg')) {
+                  final alreadyInList = songs.any((s) => s['file'] == entity.path);
+                  final isHidden = hiddenPaths.contains(entity.path);
+                  if (!alreadyInList && !isHidden) {
+                    final rawName = entity.uri.pathSegments.last;
+                    final cleanName = rawName.replaceAll(
+                        RegExp(r'\.(mp3|m4a|wav|ogg)$', caseSensitive: false), '');
+                    songs.add({
+                      'title': cleanName,
+                      'artist': 'Device Storage',
+                      'genre': 'Saved Local Audio',
+                      'file': entity.path,
+                      'source': 'device',
+                    });
+                    foundNew = true;
+                  }
+                }
+              }
+            }
+          } catch (_) {}
+        }
+      }
+
+      if (foundNew) {
+        await saveLocalSongs();
+        onStateChanged?.call();
+      }
+    }
+  }
+  Future<void> saveLocalSongs() async {
+    final prefs = await SharedPreferences.getInstance();
+    final localOnly = songs.where((s) => s['source'] == 'device').toList();
+    final encoded = localOnly.map((s) => jsonEncode(s)).toList();
+    await prefs.setStringList('saved_local_songs', encoded);
+    await prefs.setStringList('hidden_local_songs', hiddenPaths);
+  }
+
+  Future<void> removeLocalSong(String filePath) async {
+    final removedIdx = songs.indexWhere((s) => s['file'] == filePath);
+    if (removedIdx == -1) return;
+
+    if (!hiddenPaths.contains(filePath)) {
+      hiddenPaths.add(filePath);
+    }
+
+    if (currentIndex == removedIdx) {
+      await pause();
+      currentIndex = 0;
+    } else if (currentIndex > removedIdx) {
+      currentIndex--;
+    }
+
+    songs.removeAt(removedIdx);
+    await saveLocalSongs();
+    onStateChanged?.call();
+  }
+
+  void _updateSystemMediaNotification(bool playing) {
+    final current = songs[currentIndex];
+    mediaItem.add(MediaItem(
+      id: current['file']!,
+      album: current['genre'] ?? 'Play Music',
+      title: current['title']!,
+      artist: current['artist'] ?? 'Play Music',
+    ));
+
+    playbackState.add(playbackState.value.copyWith(
+      controls: [
+        MediaControl.skipToPrevious,
+        playing ? MediaControl.pause : MediaControl.play,
+        MediaControl.skipToNext,
+      ],
+      systemActions: const {MediaAction.seek},
+      androidCompactActionIndices: const,
+      processingState: AudioProcessingState.ready,
+      playing: playing,
+    ));
+  }
+
+  Future<void> playIndex(int index) async {
+    currentIndex = index;
+    await play();
+  }
+
+  @override
+  Future<void> play() async {
+    final current = songs[currentIndex];
+    try {
+      await player.stop();
+      if (current['source'] == 'device') {
+        await player.play(DeviceFileSource(current['file']!));
+      } else {
+        await player.play(AssetSource(current['file']!));
+      }
+      _updateSystemMediaNotification(true);
+      onStateChanged?.call();
+    } catch (_) {
+      _updateSystemMediaNotification(false);
+      onStateChanged?.call();
+    }
+  }
+
+  @override
+  Future<void> pause() async {
+    await player.pause();
+    _updateSystemMediaNotification(false);
+    onStateChanged?.call();
+  }
+
+  @override
+  Future<void> skipToNext() async {
+    if (isShuffle && songs.length > 1) {
+      int nextIdx = currentIndex;
+      while (nextIdx == currentIndex) {
+        nextIdx = Random().nextInt(songs.length);
+      }
+      currentIndex = nextIdx;
+    } else {
+      currentIndex = (currentIndex + 1) % songs.length;
+    }
+    await play();
+  }
+
+  @override
+  Future<void> skipToPrevious() async {
+    currentIndex = (currentIndex - 1 + songs.length) % songs.length;
+    await play();
   }
 }
 class LoginScreen extends StatefulWidget {
@@ -172,79 +394,44 @@ class MusicPlayerApp extends StatefulWidget {
 }
 
 class _MusicPlayerAppState extends State<MusicPlayerApp> {
-  final AudioPlayer player = AudioPlayer();
-  bool isPlaying = false;
-  bool isShuffle = false;
-  int currentIndex = 0;
   String selectedCategory = 'Music Library';
-
-  // Songs 1-2 show cover pictures; extra songs automatically show the orange music icon!
-  final List<Map<String, String>> songs = [
-    {
-      'title': 'Shri Durga Mahatmyam (Devi Mahatmyam)',
-      'artist': 'Traditional Sanskrit Recitation',
-      'genre': 'Navratri & Devotional Prayer',
-      'file': 'devi_mahatmyam.mp3',
-      'image': 'assets/durga_maa.jpg',
-      'source': 'asset',
-    },
-    {
-      'title': 'Traditional Indian Folk & Bhajan',
-      'artist': 'Indian Devotional Ensemble',
-      'genre': 'Folk & Devotional',
-      'file': 'folk_song.mp3',
-      'image': 'assets/folk_devotional.jpg',
-      'source': 'asset',
-    },
-    {
-      'title': 'Devotional Folk Track 3',
-      'artist': 'Traditional Folk Ensemble',
-      'genre': 'Folk & Devotional',
-      'file': 'folk_song_2.mp3',
-      'source': 'asset',
-    },
-  ];
 
   @override
   void initState() {
     super.initState();
-    player.onPlayerComplete.listen((event) => nextSong());
+    audioHandler.onStateChanged = () {
+      if (mounted) setState(() {});
+    };
+    audioHandler.loadAndScanStorageSongs();
   }
 
-  @override
-  void dispose() {
-    player.dispose();
-    super.dispose();
-  }
-
-  Future<void> importSongsFromStorage() async {
+  Future<void> findSongsInStorageManually() async {
     var status = await Permission.storage.request();
     if (!status.isGranted) {
       status = await Permission.audio.request();
     }
 
     try {
-      final files = await FilePicker.pickFiles(
-        type: FileType.audio,
-      );
-
+      final files = await FilePicker.pickFiles(type: FileType.audio);
       if (files.isNotEmpty) {
-        setState(() {
-          for (var picked in files) {
-            if (picked.path != null) {
-              songs.add({
-                'title': picked.name.replaceAll('.mp3', ''),
+        for (var picked in files) {
+          if (picked.path != null) {
+            audioHandler.hiddenPaths.remove(picked.path);
+            final alreadyAdded = audioHandler.songs.any((s) => s['file'] == picked.path);
+            if (!alreadyAdded) {
+              audioHandler.songs.add({
+                'title': picked.name.replaceAll(RegExp(r'\.(mp3|m4a|wav|ogg)$', caseSensitive: false), ''),
                 'artist': 'Device Storage',
-                'genre': 'Local Audio',
+                'genre': 'Saved Local Audio',
                 'file': picked.path!,
                 'source': 'device',
               });
             }
           }
-          selectedCategory = 'Device Storage';
-          currentIndex = songs.length - 1;
-        });
-        await playCurrentSong();
+        }
+        await audioHandler.saveLocalSongs();
+        setState(() => selectedCategory = 'Saved Local Songs');
+        await audioHandler.playIndex(audioHandler.songs.length - 1);
       }
     } catch (e) {
       if (mounted) {
@@ -255,57 +442,14 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
     }
   }
 
-  Future<void> playCurrentSong() async {
-    final current = songs[currentIndex];
-    try {
-      await player.stop();
-      if (current['source'] == 'device') {
-        await player.play(DeviceFileSource(current['file']!));
-      } else {
-        await player.play(AssetSource(current['file']!));
-      }
-      setState(() => isPlaying = true);
-    } catch (e) {
-      setState(() => isPlaying = false);
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not play ${current['title']}')),
-        );
-      }
-    }
-  }
-
-  Future<void> toggleMusic() async {
-    if (isPlaying) {
-      await player.pause();
-      setState(() => isPlaying = false);
-    } else {
-      await playCurrentSong();
-    }
-  }
-
-  Future<void> nextSong() async {
-    setState(() {
-      if (isShuffle && songs.length > 1) {
-        int nextIdx = currentIndex;
-        while (nextIdx == currentIndex) {
-          nextIdx = Random().nextInt(songs.length);
-        }
-        currentIndex = nextIdx;
-      } else {
-        currentIndex = (currentIndex + 1) % songs.length;
-      }
-    });
-    await playCurrentSong();
-  }
-
-  Future<void> previousSong() async {
-    setState(() => currentIndex = (currentIndex - 1 + songs.length) % songs.length);
-    await playCurrentSong();
-  }
   @override
   Widget build(BuildContext context) {
-    final currentSong = songs[currentIndex];
+    final allSongs = audioHandler.songs;
+    final displayedSongs = selectedCategory == 'Saved Local Songs'
+        ? allSongs.where((s) => s['source'] == 'device').toList()
+        : allSongs;
+    final currentSong = allSongs[audioHandler.currentIndex];
+    final isPlaying = audioHandler.playbackState.value.playing;
     final hasImage = currentSong['image'] != null && currentSong['image']!.isNotEmpty;
 
     return Scaffold(
@@ -316,7 +460,7 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
           children: [
             Container(
               width: double.infinity,
-              padding: const EdgeInsets.fromLTRB(20, 50, 20, 24),
+              padding: const EdgeInsets.fromLTRB(20, 48, 20, 22),
               decoration: const BoxDecoration(
                 gradient: LinearGradient(
                   colors: [Color(0xFFFF5E62), Color(0xFFFF8008), Color(0xFFFFC837)],
@@ -327,11 +471,11 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
               child: const Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Icon(Icons.music_note_rounded, size: 46, color: Colors.white),
-                  SizedBox(height: 10),
+                  Icon(Icons.music_note_rounded, size: 42, color: Colors.white),
+                  SizedBox(height: 8),
                   Text('Play Music',
-                      style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.white)),
-                  Text('Your Music Library',
+                      style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white)),
+                  Text('Saved Playlists & Library',
                       style: TextStyle(fontSize: 13, color: Colors.white70)),
                 ],
               ),
@@ -346,21 +490,22 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
               },
             ),
             ListTile(
-              leading: const Icon(Icons.self_improvement_rounded, color: Color(0xFFFF5E62)),
-              title: const Text('Devotional & Festivals'),
-              selected: selectedCategory == 'Devotional & Festivals',
+              leading: const Icon(Icons.playlist_add_check_rounded, color: Color(0xFFFF5E62)),
+              title: const Text('Saved Local Songs', style: TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: const Text('Your saved phone/tablet songs'),
+              selected: selectedCategory == 'Saved Local Songs',
               onTap: () {
-                setState(() => selectedCategory = 'Devotional & Festivals');
+                setState(() => selectedCategory = 'Saved Local Songs');
                 Navigator.pop(context);
               },
             ),
             ListTile(
-              leading: const Icon(Icons.folder_open_rounded, color: Color(0xFFFFB800)),
-              title: const Text('Device Storage (Find Songs)'),
-              subtitle: const Text('Scan phone/tablet for MP3s'),
+              leading: const Icon(Icons.search_rounded, color: Color(0xFFFFB800)),
+              title: const Text('Find Songs In Storage', style: TextStyle(fontWeight: FontWeight.bold)),
+              subtitle: const Text('Browse folders if a song is missing'),
               onTap: () {
                 Navigator.pop(context);
-                importSongsFromStorage();
+                findSongsInStorageManually();
               },
             ),
             const Spacer(),
@@ -369,7 +514,7 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
               leading: const Icon(Icons.logout, color: Colors.black54),
               title: const Text('Sign Out'),
               onTap: () async {
-                await player.stop();
+                await audioHandler.pause();
                 await FirebaseAuth.instance.signOut();
               },
             ),
@@ -385,191 +530,223 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
               child: Column(
                 children: [
                   Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                     child: Row(
                       children: [
                         Builder(
                           builder: (context) => IconButton(
-                            icon: const Icon(Icons.menu_rounded, size: 30, color: Color(0xFF2D2D2D)),
-                            tooltip: 'Open Menu',
+                            icon: const Icon(Icons.menu_rounded, size: 28, color: Color(0xFF2D2D2D)),
                             onPressed: () => Scaffold.of(context).openDrawer(),
                           ),
                         ),
-                        const SizedBox(width: 6),
+                        const SizedBox(width: 4),
                         Text(selectedCategory,
-                            style: const TextStyle(fontSize: 21, fontWeight: FontWeight.bold)),
+                            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                         const Spacer(),
                         IconButton(
-                          icon: const Icon(Icons.folder_open_rounded, color: Color(0xFFFF7A00)),
-                          tooltip: 'Load songs from storage',
-                          onPressed: importSongsFromStorage,
+                          icon: const Icon(Icons.refresh_rounded, color: Color(0xFFFF7A00)),
+                          tooltip: 'Rescan storage for songs',
+                          onPressed: () => audioHandler.loadAndScanStorageSongs(),
                         ),
                       ],
                     ),
                   ),
                   Container(
-                    margin: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-                    padding: const EdgeInsets.all(20),
+                    margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                    padding: const EdgeInsets.all(14),
                     decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.90),
-                      borderRadius: BorderRadius.circular(28),
+                      color: Colors.white.withValues(alpha: 0.92),
+                      borderRadius: BorderRadius.circular(22),
                     ),
                     child: Column(
                       children: [
-                        if (hasImage)
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(20),
-                            child: Image.asset(
-                              currentSong['image']!,
-                              width: 125,
-                              height: 125,
-                              fit: BoxFit.cover,
-                              errorBuilder: (context, error, stackTrace) => Container(
-                                width: 105,
-                                height: 105,
-                                decoration: BoxDecoration(
-                                  color: const Color(0xFFFF7A00).withValues(alpha: 0.14),
-                                  shape: BoxShape.circle,
+                        Row(
+                          children: [
+                            if (hasImage)
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(14),
+                                child: Image.asset(
+                                  currentSong['image']!,
+                                  width: 60,
+                                  height: 60,
+                                  fit: BoxFit.cover,
+                                  errorBuilder: (_, __, ___) => _defaultArtBox(),
                                 ),
-                                child: const Icon(Icons.music_note_rounded,
-                                    size: 52, color: Color(0xFFFF7A00)),
+                              )
+                            else
+                              _defaultArtBox(),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    currentSong['title']!,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    '${currentSong['artist']} • ${currentSong['genre']}',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(fontSize: 12, color: Colors.black54),
+                                  ),
+                                ],
                               ),
                             ),
-                          )
-                        else
-                          Container(
-                            width: 105,
-                            height: 105,
-                            decoration: BoxDecoration(
-                              color: const Color(0xFFFF7A00).withValues(alpha: 0.14),
-                              shape: BoxShape.circle,
-                            ),
-                            child: const Icon(Icons.music_note_rounded,
-                                size: 52, color: Color(0xFFFF7A00)),
-                          ),
-                        const SizedBox(height: 12),
-                        Text(currentSong['title']!,
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 4),
-                        Text('${currentSong['artist']} • ${currentSong['genre']}',
-                            textAlign: TextAlign.center,
-                            style: const TextStyle(fontSize: 13, color: Colors.black54)),
-                        const SizedBox(height: 16),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
                         Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
+                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                           children: [
                             IconButton(
-                                onPressed: previousSong,
-                                iconSize: 38,
-                                icon: const Icon(Icons.skip_previous_rounded)),
-                            const SizedBox(width: 14),
+                              onPressed: () => audioHandler.skipToPrevious(),
+                              iconSize: 28,
+                              icon: const Icon(Icons.skip_previous_rounded),
+                            ),
                             ElevatedButton(
-                              onPressed: toggleMusic,
+                              onPressed: () =>
+                                  isPlaying ? audioHandler.pause() : audioHandler.play(),
                               style: ElevatedButton.styleFrom(
                                 backgroundColor: const Color(0xFFFF7A00),
                                 foregroundColor: Colors.white,
                                 shape: const CircleBorder(),
-                                padding: const EdgeInsets.all(18),
+                                padding: const EdgeInsets.all(12),
                               ),
                               child: Icon(
                                   isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-                                  size: 36),
+                                  size: 26),
                             ),
-                            const SizedBox(width: 14),
                             IconButton(
-                                onPressed: nextSong,
-                                iconSize: 38,
-                                icon: const Icon(Icons.skip_next_rounded)),
-                          ],
-                        ),
-                        const SizedBox(height: 14),
-                        GestureDetector(
-                          onTap: () {
-                            setState(() => isShuffle = !isShuffle);
-                            if (isShuffle) nextSong();
-                          },
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 10),
-                            decoration: BoxDecoration(
-                              gradient: const LinearGradient(
-                                colors: [Color(0xFFFF5E62), Color(0xFFFF8008), Color(0xFFFFC837)],
-                              ),
-                              borderRadius: BorderRadius.circular(25),
+                              onPressed: () => audioHandler.skipToNext(),
+                              iconSize: 28,
+                              icon: const Icon(Icons.skip_next_rounded),
                             ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                const Icon(Icons.shuffle_rounded, color: Colors.white, size: 20),
-                                const SizedBox(width: 8),
-                                Text(
-                                  isShuffle ? 'SHUFFLE ON' : 'SHUFFLE ALL',
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontWeight: FontWeight.bold,
-                                    letterSpacing: 0.8,
+                            GestureDetector(
+                              onTap: () {
+                                setState(() => audioHandler.isShuffle = !audioHandler.isShuffle);
+                                if (audioHandler.isShuffle) audioHandler.skipToNext();
+                              },
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                decoration: BoxDecoration(
+                                  gradient: LinearGradient(
+                                    colors: audioHandler.isShuffle
+                                        ? [const Color(0xFFFF5E62), const Color(0xFFFF8008), const Color(0xFFFFC837)]
+                                        : [Colors.grey.shade400, Colors.grey.shade500],
                                   ),
+                                  borderRadius: BorderRadius.circular(18),
                                 ),
-                              ],
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Icon(Icons.shuffle_rounded, color: Colors.white, size: 17),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      audioHandler.isShuffle ? 'ON' : 'SHUFFLE',
+                                      style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.bold),
+                                    ),
+                                  ],
+                                ),
+                              ),
                             ),
-                          ),
+                          ],
                         ),
                       ],
                     ),
                   ),
                   Expanded(
-                    child: ListView.builder(
-                      padding: const EdgeInsets.symmetric(horizontal: 20),
-                      itemCount: songs.length,
-                      itemBuilder: (context, index) {
-                        final song = songs[index];
-                        final isSelected = index == currentIndex;
-                        final songHasImg = song['image'] != null && song['image']!.isNotEmpty;
+                    child: displayedSongs.isEmpty
+                        ? const Center(
+                            child: Text('No saved local songs found yet.\nOpen the menu -> Find Songs In Storage!',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(color: Colors.black54)),
+                          )
+                        : ListView.builder(
+                            padding: const EdgeInsets.symmetric(horizontal: 16),
+                            itemCount: displayedSongs.length,
+                            itemBuilder: (context, index) {
+                              final song = displayedSongs[index];
+                              final realIndex = allSongs.indexOf(song);
+                              final isSelected = realIndex == audioHandler.currentIndex;
+                              final songHasImg =
+                                  song['image'] != null && song['image']!.isNotEmpty;
 
-                        return Card(
-                          color: isSelected
-                              ? const Color(0xFFFF7A00).withValues(alpha: 0.15)
-                              : Colors.white.withValues(alpha: 0.85),
-                          elevation: 0,
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                          child: ListTile(
-                            leading: songHasImg
-                                ? ClipRRect(
-                                    borderRadius: BorderRadius.circular(10),
-                                    child: Image.asset(
-                                      song['image']!,
-                                      width: 45,
-                                      height: 45,
-                                      fit: BoxFit.cover,
-                                      errorBuilder: (context, error, stackTrace) => CircleAvatar(
-                                        backgroundColor:
-                                            const Color(0xFFFF7A00).withValues(alpha: 0.14),
-                                        child: const Icon(Icons.music_note_rounded,
-                                            color: Color(0xFFFF7A00)),
-                                      ),
-                                    ),
-                                  )
-                                : CircleAvatar(
-                                    backgroundColor:
-                                        const Color(0xFFFF7A00).withValues(alpha: 0.14),
-                                    child: Icon(
-                                      isSelected && isPlaying
-                                          ? Icons.equalizer_rounded
-                                          : Icons.music_note_rounded,
-                                      color: const Color(0xFFFF7A00),
-                                    ),
-                                  ),
-                            title: Text(song['title']!,
-                                style: const TextStyle(fontWeight: FontWeight.bold)),
-                            subtitle: Text('${song['artist']} • ${song['genre']}'),
-                            onTap: () async {
-                              setState(() => currentIndex = index);
-                              await playCurrentSong();
+                              return Card(
+                                color: isSelected
+                                    ? const Color(0xFFFF7A00).withValues(alpha: 0.15)
+                                    : Colors.white.withValues(alpha: 0.85),
+                                elevation: 0,
+                                shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(14)),
+                                child: ListTile(
+                                  dense: true,
+                                  leading: songHasImg
+                                      ? ClipRRect(
+                                          borderRadius: BorderRadius.circular(8),
+                                          child: Image.asset(
+                                            song['image']!,
+                                            width: 42,
+                                            height: 42,
+                                            fit: BoxFit.cover,
+                                            errorBuilder: (_, __, ___) =>
+                                                const Icon(Icons.music_note_rounded,
+                                                    color: Color(0xFFFF7A00)),
+                                          ),
+                                        )
+                                      : CircleAvatar(
+                                          radius: 20,
+                                          backgroundColor:
+                                              const Color(0xFFFF7A00).withValues(alpha: 0.14),
+                                          child: Icon(
+                                            isSelected && isPlaying
+                                                ? Icons.equalizer_rounded
+                                                : Icons.music_note_rounded,
+                                            color: const Color(0xFFFF7A00),
+                                            size: 20,
+                                          ),
+                                        ),
+                                  title: Text(song['title']!,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(fontWeight: FontWeight.bold)),
+                                  subtitle: Text('${song['artist']} • ${song['genre']}'),
+                                  trailing: song['source'] == 'device'
+                                      ? PopupMenuButton<String>(
+                                          icon: const Icon(Icons.more_vert_rounded,
+                                              color: Colors.black54),
+                                          onSelected: (value) async {
+                                            if (value == 'remove') {
+                                              await audioHandler.removeLocalSong(song['file']!);
+                                            }
+                                          },
+                                          itemBuilder: (context) => [
+                                            const PopupMenuItem(
+                                              value: 'remove',
+                                              child: Row(
+                                                children: [
+                                                  Icon(Icons.delete_outline_rounded,
+                                                      color: Colors.red, size: 20),
+                                                  SizedBox(width: 8),
+                                                  Text('Remove from library',
+                                                      style: TextStyle(color: Colors.red)),
+                                                ],
+                                              ),
+                                            ),
+                                          ],
+                                        )
+                                      : null,
+                                  onTap: () => audioHandler.playIndex(realIndex),
+                                ),
+                              );
                             },
                           ),
-                        );
-                      },
-                    ),
                   ),
                 ],
               ),
@@ -577,6 +754,18 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
           ),
         ),
       ),
+    );
+  }
+
+  Widget _defaultArtBox() {
+    return Container(
+      width: 60,
+      height: 60,
+      decoration: BoxDecoration(
+        color: const Color(0xFFFF7A00).withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: const Icon(Icons.music_note_rounded, size: 32, color: Color(0xFFFF7A00)),
     );
   }
 }
