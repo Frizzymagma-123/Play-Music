@@ -224,7 +224,7 @@ class _MusicPlayerAppState extends State<MusicPlayerApp> {
     }
 
     try {
-      FilePickerResult? result = await FilePicker.platform.pickFiles(
+      final result = await FilePicker.pickFiles(
         type: FileType.audio,
         allowMultiple: true,
       );
