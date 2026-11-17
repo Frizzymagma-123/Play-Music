@@ -12,6 +12,8 @@ dependencies:
   flutter:
     sdk: flutter
   audioplayers: any
+  audio_service: any
+  shared_preferences: any
   firebase_core: any
   firebase_auth: any
   file_picker: any
